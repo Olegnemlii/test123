@@ -1,4 +1,4 @@
-module rofl228
+module github.com/Olegnemlii/test123
 
 go 1.24
 

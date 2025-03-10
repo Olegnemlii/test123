@@ -2,160 +2,149 @@ package service
 
 import (
 	"context"
-	"errors"
+	"fmt"
+	"log"
+	"math/rand"
 	"time"
 
-	"test123/internal/domain"
-	"test123/internal/repository/postgres"
-	"test123/internal/repository/redis"
-	"test123/pkg/hash"
-	"test123/pkg/token"
+	"github.com/Olegnemlii/test123/internal/domain"
+	"github.com/Olegnemlii/test123/internal/repository"
 
+	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 )
 
-// UserService определяет методы работы с пользователями.
 type UserService struct {
-	postgresRepo *postgres.UserRepository
-	redisRepo    *redis.UserRepository
-	tokenManager *token.Manager
+	userRepo repository.UserRepository
 }
 
-// NewUserService создает новый экземпляр UserService.
-func NewUserService(pgRepo *postgres.UserRepository, redisRepo *redis.UserRepository, tokenManager *token.Manager) *UserService {
-	return &UserService{
-		postgresRepo: pgRepo,
-		redisRepo:    redisRepo,
-		tokenManager: tokenManager,
-	}
+func NewUserService(userRepo repository.UserRepository) *UserService {
+	return &UserService{userRepo: userRepo}
 }
 
-// Register регистрирует нового пользователя.
-func (s *UserService) Register(ctx context.Context, email, password string) (*domain.User, error) {
-	// Проверяем, существует ли пользователь
-	existingUser, _ := s.postgresRepo.GetByEmail(ctx, email)
-	if existingUser != nil {
-		return nil, errors.New("пользователь с таким email уже существует")
-	}
-
-	// Хэшируем пароль
-	hashedPassword, err := hash.Generate(password)
+// Генерация подписи
+func (s *UserService) CreateSignature(ctx context.Context) (uuid.UUID, error) {
+	newUUID, err := uuid.NewRandom()
 	if err != nil {
-		return nil, err
+		log.Printf("error generating uuid: %v", err)
+		return uuid.Nil, err
 	}
-
-	// Создаем пользователя
-	user := &domain.User{
-		Email:    email,
-		Password: hashedPassword,
-	}
-
-	// Сохраняем в БД
-	createdUser, err := s.postgresRepo.Create(ctx, user)
-	if err != nil {
-		return nil, err
-	}
-
-	// Кэшируем пользователя в Redis
-	err = s.redisRepo.SaveUser(ctx, createdUser, time.Hour)
-	if err != nil {
-		return nil, err
-	}
-
-	return createdUser, nil
+	return newUUID, nil
 }
 
-// Login аутентифицирует пользователя и выдает токены.
-func (s *UserService) Login(ctx context.Context, email, password string) (*token.TokenPair, *domain.User, error) {
-	// Получаем пользователя из БД
-	user, err := s.postgresRepo.GetByEmail(ctx, email)
-	if err != nil || user == nil {
-		return nil, nil, errors.New("неверный email или пароль")
-	}
-
-	// Проверяем пароль
-	err = bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(password))
+// Верификация кода
+func (s *UserService) VerifyCode(ctx context.Context, email string, code string) (bool, error) {
+	storedCode, err := s.userRepo.GetVerificationCode(ctx, email)
 	if err != nil {
-		return nil, nil, errors.New("неверный email или пароль")
+		log.Printf("error getting verification code: %v", err)
+		return false, err
 	}
 
-	// Генерируем токены
-	tokens, err := s.tokenManager.GenerateTokenPair(user.ID)
+	if storedCode != code {
+		log.Printf("verification code does not match")
+		return false, fmt.Errorf("invalid verification code")
+	}
+
+	err = s.userRepo.DeleteVerificationCode(ctx, email)
 	if err != nil {
-		return nil, nil, err
+		log.Printf("error deleting verification code: %v", err)
+		return false, err
 	}
-
-	// Сохраняем refresh-токен в Redis
-	err = s.redisRepo.SaveToken(ctx, user.ID, tokens.RefreshToken, 24*time.Hour)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return tokens, user, nil
+	return true, nil
 }
 
-// RefreshTokens обновляет access и refresh токены.
-func (s *UserService) RefreshTokens(ctx context.Context, refreshToken string) (*token.TokenPair, *domain.User, error) {
-	// Проверяем refresh-токен
-	userID, err := s.tokenManager.ValidateRefreshToken(refreshToken)
+// Создание пользователя
+func (s *UserService) CreateUser(ctx context.Context, user *domain.User) (*domain.User, error) {
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(user.Password), bcrypt.DefaultCost)
 	if err != nil {
-		return nil, nil, errors.New("невалидный refresh-токен")
+		log.Printf("error hashing password: %v", err)
+		return nil, fmt.Errorf("failed to hash password: %w", err)
 	}
+	user.Password = string(hashedPassword)
+	user.CreatedAt = time.Now().UTC()
+	user.UpdatedAt = time.Now().UTC()
 
-	// Получаем пользователя
-	user, err := s.postgresRepo.GetByID(ctx, userID)
-	if err != nil {
-		return nil, nil, errors.New("пользователь не найден")
-	}
-
-	// Проверяем, совпадает ли токен с тем, что в Redis
-	storedToken, err := s.redisRepo.GetToken(ctx, userID)
-	if err != nil || storedToken != refreshToken {
-		return nil, nil, errors.New("refresh-токен не совпадает")
-	}
-
-	// Генерируем новый токен
-	tokens, err := s.tokenManager.GenerateTokenPair(user.ID)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// Обновляем refresh-токен в Redis
-	err = s.redisRepo.SaveToken(ctx, user.ID, tokens.RefreshToken, 24*time.Hour)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return tokens, user, nil
+	return s.userRepo.CreateUser(ctx, user)
 }
 
-// GetMe возвращает данные текущего пользователя.
-func (s *UserService) GetMe(ctx context.Context, userID string) (*domain.User, error) {
-	// Пробуем получить пользователя из кеша Redis
-	user, err := s.redisRepo.GetUser(ctx, userID)
-	if err != nil {
-		return nil, err
-	}
-	if user != nil {
-		return user, nil
-	}
-
-	// Если нет в Redis, ищем в БД
-	user, err = s.postgresRepo.GetByID(ctx, userID)
-	if err != nil {
-		return nil, err
-	}
-
-	// Кешируем пользователя
-	err = s.redisRepo.SaveUser(ctx, user, time.Hour)
-	if err != nil {
-		return nil, err
-	}
-
-	return user, nil
+// Получение пользователя по ID
+func (s *UserService) GetUserByID(ctx context.Context, id uuid.UUID) (*domain.User, error) {
+	return s.userRepo.GetUserByID(ctx, id)
 }
 
-// LogOut удаляет refresh-токен из Redis.
-func (s *UserService) LogOut(ctx context.Context, userID string) error {
-	return s.redisRepo.DeleteToken(ctx, userID)
+// Получение пользователя по Email
+func (s *UserService) GetUserByEmail(ctx context.Context, email string) (*domain.User, error) {
+	return s.userRepo.GetUserByEmail(ctx, email)
+}
+
+// Обновление пользователя
+func (s *UserService) UpdateUser(ctx context.Context, user *domain.User) error {
+	return s.userRepo.UpdateUser(ctx, user)
+}
+
+// Удаление пользователя
+func (s *UserService) DeleteUser(ctx context.Context, id uuid.UUID) error {
+	return s.userRepo.DeleteUser(ctx, id)
+}
+
+// Получение почты по подписи
+func (s *UserService) GetEmailBySignature(ctx context.Context, signature uuid.UUID) (string, error) {
+	return s.userRepo.GetEmailBySignature(ctx, signature)
+}
+
+// Обновление подписи пользователя
+func (s *UserService) UpdateUserSignature(ctx context.Context, userID uuid.UUID, signature uuid.UUID) error {
+	return s.userRepo.UpdateUserSignature(ctx, userID, signature)
+}
+
+// Хранение кода подтверждения
+func (s *UserService) StoreRefreshToken(ctx context.Context, email, refreshToken string) error {
+	return s.userRepo.StoreRefreshToken(ctx, email, refreshToken)
+}
+
+// Получение кода подтверждения
+func (s *UserService) GetRefreshToken(ctx context.Context, email string) (string, error) {
+	return s.userRepo.GetRefreshToken(ctx, email)
+}
+
+// Удаление кода подтверждения
+func (s *UserService) DeleteRefreshToken(ctx context.Context, email string) error {
+	return s.userRepo.DeleteRefreshToken(ctx, email)
+}
+
+// StoreVerificationCode - сохраняет код верификации
+func (s *UserService) StoreVerificationCode(ctx context.Context, email string, code string) error {
+	return s.userRepo.StoreVerificationCode(ctx, email, code)
+}
+
+// GenerateVerificationCode - генерирует код верификации
+func (s *UserService) GenerateVerificationCode(ctx context.Context, email string) (string, error) {
+	code := generateRandomCode(6) // Generate a 6-digit code
+	err := s.userRepo.StoreVerificationCode(ctx, email, code)
+	if err != nil {
+		log.Printf("error storing verification code: %v", err)
+		return "", err
+	}
+	return code, nil
+}
+
+// Функция для генерации случайной подписи
+func generateRandomCode(length int) string {
+	rand.Seed(time.Now().UnixNano())
+	const digits = "0123456789"
+	code := make([]byte, length)
+	for i := range code {
+		code[i] = digits[rand.Intn(len(digits))]
+	}
+	return string(code)
+}
+
+// GetVerificationCode
+func (s *UserService) GetVerificationCode(ctx context.Context, email string) (string, error) {
+	return s.userRepo.GetVerificationCode(ctx, email)
+}
+
+// DeleteVerificationCode
+func (s *UserService) DeleteVerificationCode(ctx context.Context, email string) error {
+	return s.userRepo.DeleteVerificationCode(ctx, email)
 }

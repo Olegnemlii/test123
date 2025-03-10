@@ -1,53 +1,71 @@
 package main
 
 import (
+	"database/sql"
+	"fmt"
+	"io/ioutil"
 	"log"
-	"os"
-	"os/signal"
-	"syscall"
 
-	"githumb.com/olegnemlii/test123/internal/config"
-	"githumb.com/olegnemlii/test123/internal/repository/postgres"
-	"githumb.com/olegnemlii/test123/internal/service"
-	"githumb.com/olegnemlii/test123/internal/transport/grpc/server"
+	"github.com/Olegnemlii/test123/internal/config"
+	"github.com/Olegnemlii/test123/internal/service"
+	"github.com/Olegnemlii/test123/internal/transport/grpc/handler"
+	"github.com/Olegnemlii/test123/internal/transport/grpc/server"
+	"github.com/Olegnemlii/test123/pkg/db"
+
+	"github.com/Olegnemlii/test123/internal/repository/postgres"
+
+	_ "github.com/lib/pq"
 )
 
 func main() {
-	// Загружаем конфигурацию
-	cfg, err := config.LoadConfig()
+	// Load Config
+	cfg, err := config.LoadConfig(".")
 	if err != nil {
-		log.Fatalf("Ошибка загрузки конфигурации: %v", err)
+		log.Fatalf("failed to load config: %v", err)
 	}
 
-	// Подключаем базу данных
-	db, err := postgres.ConnectDB(cfg.DatabaseURL)
+	// Database Connection
+	dbConnection, err := db.NewDatabase(cfg.DatabaseURL)
 	if err != nil {
-		log.Fatalf("Ошибка подключения к БД: %v", err)
+		log.Fatalf("failed to connect to database: %v", err)
 	}
-	defer db.Close()
+	defer dbConnection.Close()
+	database := dbConnection.GetDB() // Use GetDB to get *sql.DB
 
-	// Инициализируем репозиторий
-	userRepo := postgres.NewUserRepository(db)
+	// Run migrations
+	if err := runMigrations(database); err != nil {
+		log.Fatalf("failed to run migrations: %v", err)
+	}
 
-	// Создаем сервисы
-	userService := service.NewUserService(userRepo)
+	// Repository
+	userRepo := postgres.NewPostgresUserRepository(database)
 
-	// Запускаем gRPC сервер
-	grpcServer := server.NewGRPCServer(userService, cfg.GRPCPort)
+	// Service
+	authService := service.NewUserService(userRepo)
 
-	go func() {
-		if err := grpcServer.Run(); err != nil {
-			log.Fatalf("Ошибка при запуске gRPC сервера: %v", err)
-		}
-	}()
+	// gRPC Handler
+	authHandler := handler.NewAuthHandler(authService)
 
-	// Ожидание сигнала завершения (Ctrl+C)
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	// Start gRPC server
+	if err := server.StartGRPCServer(cfg, authHandler); err != nil {
+		log.Fatalf("failed to start gRPC server: %v", err)
+	}
+}
 
-	<-stop
+func runMigrations(db *sql.DB) error {
+	// Read the migration file
+	migrationFile := "migrations/12312312_users.sql"
+	migrationSQL, err := ioutil.ReadFile(migrationFile)
+	if err != nil {
+		return fmt.Errorf("failed to read migration file %s: %w", migrationFile, err)
+	}
 
-	log.Println("Завершаем работу сервера...")
-	grpcServer.Stop()
-	log.Println("Сервер остановлен.")
+	// Execute the migration
+	_, err = db.Exec(string(migrationSQL))
+	if err != nil {
+		return fmt.Errorf("failed to execute migration: %w", err)
+	}
+
+	log.Println("Migrations ran successfully")
+	return nil
 }

@@ -2,55 +2,51 @@ package config
 
 import (
 	"fmt"
+	"log"
 	"os"
-	"strconv"
 
 	"github.com/joho/godotenv"
 )
 
-// Config содержит настройки приложения.
+// Config stores the application configuration
 type Config struct {
-	GRPCPort int
-	DBHost   string
-	DBPort   int
-	DBUser   string
-	DBPass   string
-	DBName   string
+	Port            string
+	DatabaseURL     string
+	MailopostApiKey string
+	MailopostURL    string
 }
 
-// LoadConfig загружает конфигурацию из `.env` файла и переменных окружения.
-func LoadConfig() (*Config, error) {
-	// Загружаем переменные окружения из .env файла (если есть)
-	if err := godotenv.Load(); err != nil {
-		fmt.Println("Нет .env файла, используем переменные окружения")
-	}
-
-	grpcPort, err := strconv.Atoi(getEnv("GRPC_PORT", "50051"))
+// LoadConfig loads the configuration from environment variables or .env file
+func LoadConfig(path string) (*Config, error) {
+	err := godotenv.Load(path + "/.env") // load .env file
 	if err != nil {
-		return nil, fmt.Errorf("ошибка конвертации GRPC_PORT: %v", err)
+		log.Printf("could not load .env file: %v", err)
 	}
 
-	dbPort, err := strconv.Atoi(getEnv("DB_PORT", "5432"))
-	if err != nil {
-		return nil, fmt.Errorf("ошибка конвертации DB_PORT: %v", err)
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "50051" // default port
 	}
 
-	cfg := &Config{
-		GRPCPort: grpcPort,
-		DBHost:   getEnv("DB_HOST", "localhost"),
-		DBPort:   dbPort,
-		DBUser:   getEnv("DB_USER", "postgres"),
-		DBPass:   getEnv("DB_PASS", "password"),
-		DBName:   getEnv("DB_NAME", "testdb"),
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		return nil, fmt.Errorf("DATABASE_URL is not set")
 	}
 
-	return cfg, nil
-}
-
-// getEnv возвращает значение переменной окружения или дефолтное значение, если переменная не установлена.
-func getEnv(key, fallback string) string {
-	if value, exists := os.LookupEnv(key); exists {
-		return value
+	mailopostApiKey := os.Getenv("MAILOPOST_API_KEY")
+	if mailopostApiKey == "" {
+		return nil, fmt.Errorf("MAILOPOST_API_KEY is not set")
 	}
-	return fallback
+
+	mailopostURL := os.Getenv("MAILOPOST_URL")
+	if mailopostURL == "" {
+		return nil, fmt.Errorf("MAILOPOST_URL is not set")
+	}
+
+	return &Config{
+		Port:            port,
+		DatabaseURL:     databaseURL,
+		MailopostApiKey: mailopostApiKey,
+		MailopostURL:    mailopostURL,
+	}, nil
 }
